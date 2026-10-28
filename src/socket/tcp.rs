@@ -498,6 +498,7 @@ pub struct Socket<'a> {
     rtte: RttEstimator,
     assembler: Assembler,
     rx_buffer: SocketBuffer<'a>,
+    rx_capacity_limit: usize,
     rx_fin_received: bool,
     tx_buffer: SocketBuffer<'a>,
     /// Interval after which, if no inbound packets are received, the connection is aborted.
@@ -523,8 +524,8 @@ pub struct Socket<'a> {
     /// The last acknowledgement number sent.
     /// I.e. in an idle socket, remote_seq_no+rx_buffer.len().
     remote_last_ack: Option<TcpSeqNumber>,
-    /// The last window length sent.
-    remote_last_win: u16,
+    /// Last advertised receive window in bytes, including an unscaled SYN window.
+    remote_last_win_len: usize,
     /// The sending window scaling factor advertised to remotes which support RFC 1323.
     /// It is zero if the window <= 64KiB and/or the remote does not support it.
     remote_win_shift: u8,
@@ -609,7 +610,6 @@ impl<'a> Socket<'a> {
         if rx_capacity > (1 << 30) {
             panic!("receiving buffer too large, cannot exceed 1 GiB")
         }
-        let rx_cap_log2 = mem::size_of::<usize>() * 8 - rx_capacity.leading_zeros() as usize;
 
         Socket {
             state: State::Closed,
@@ -618,6 +618,7 @@ impl<'a> Socket<'a> {
             assembler: Assembler::new(),
             tx_buffer,
             rx_buffer,
+            rx_capacity_limit: rx_capacity,
             rx_fin_received: false,
             timeout: None,
             keep_alive: None,
@@ -628,9 +629,9 @@ impl<'a> Socket<'a> {
             remote_seq_no: TcpSeqNumber::default(),
             remote_last_seq: TcpSeqNumber::default(),
             remote_last_ack: None,
-            remote_last_win: 0,
+            remote_last_win_len: 0,
             remote_win_len: 0,
-            remote_win_shift: rx_cap_log2.saturating_sub(16) as u8,
+            remote_win_shift: Self::receive_window_shift(rx_capacity),
             remote_win_scale: None,
             remote_has_sack: false,
             remote_mss: DEFAULT_MSS,
@@ -808,7 +809,7 @@ impl<'a> Socket<'a> {
     ///
     /// Used in internal calculations as well as packet generation.
     ///
-    /// Unlike `remote_last_win`, we take into account new packets received (but not acknowledged)
+    /// Unlike `remote_last_win_len`, we take into account new packets received (but not acknowledged)
     /// since the last window update and adjust the window length accordingly. This ensures a fair
     /// comparison between the last window length and the new window length we're going to
     /// advertise.
@@ -817,7 +818,7 @@ impl<'a> Socket<'a> {
         let last_ack = self.remote_last_ack?;
         let next_ack = self.remote_seq_no + self.rx_buffer.len();
 
-        let last_win = (self.remote_last_win as usize) << self.remote_win_shift;
+        let last_win = self.remote_last_win_len;
         let last_win_adjusted = last_win.saturating_sub(next_ack - last_ack);
 
         Some(u16::try_from(last_win_adjusted >> self.remote_win_shift).unwrap_or(u16::MAX))
@@ -966,6 +967,66 @@ impl<'a> Socket<'a> {
         Some(self.tuple?.local)
     }
 
+    /// Set the receive growth limit before listening or connecting.
+    /// Window scaling will be negotiated for this limit while the actual
+    /// advertised window remains bounded by the allocated receive buffer.
+    /// The default limit is the initial receive capacity.
+    ///
+    /// # Panics
+    /// Panics unless the socket is closed with no pending reset, and the limit
+    /// is between the current receive capacity and 1 GiB (inclusive).
+    pub fn set_receive_capacity_limit(&mut self, capacity: usize) {
+        assert!(self.state == State::Closed && self.tuple.is_none());
+        assert!(capacity >= self.rx_buffer.capacity());
+        #[cfg(not(target_pointer_width = "16"))]
+        assert!(capacity <= (1 << 30));
+        self.rx_capacity_limit = capacity;
+        self.remote_win_shift = Self::receive_window_shift(capacity);
+    }
+
+    /// Return the configured receive growth limit. Peers without window
+    /// scaling still have an unscaled advertised window, regardless of this limit.
+    pub fn receive_capacity_limit(&self) -> usize {
+        self.rx_capacity_limit
+    }
+
+    fn receive_window_shift(capacity: usize) -> u8 {
+        let bits = mem::size_of::<usize>() * 8 - capacity.leading_zeros() as usize;
+        bits.saturating_sub(16) as u8
+    }
+
+    /// Grow receive storage, preserving queued and out-of-order bytes.
+    /// The replacement may be owned or borrowed; exclusive socket access
+    /// ensures no slices into the previous storage can remain outstanding.
+    /// Callers must poll the interface afterwards to publish window updates.
+    /// Growth alone triggers an immediate update only when the scaled available
+    /// window at least doubles the remaining previously advertised window.
+    /// Smaller increases are advertised with subsequent outgoing segments.
+    ///
+    /// # Panics
+    /// Panics if the replacement is smaller than current storage or exceeds
+    /// the receive capacity limit configured before the handshake.
+    pub fn grow_receive_buffer(&mut self, buffer: SocketBuffer<'a>) {
+        assert!(buffer.capacity() >= self.rx_buffer.capacity());
+        assert!(buffer.capacity() <= self.rx_capacity_limit);
+        self.rx_buffer.grow(buffer);
+    }
+
+    /// Grow transmit storage, preserving queued bytes, including data still
+    /// awaiting acknowledgment, without changing sequence numbers or timers.
+    /// Callers must poll the interface after adding more application data.
+    ///
+    /// # Panics
+    /// Panics if the replacement is smaller than current storage.
+    pub fn grow_send_buffer(&mut self, buffer: SocketBuffer<'a>) {
+        let increased = buffer.capacity() > self.tx_buffer.capacity();
+        self.tx_buffer.grow(buffer);
+        #[cfg(feature = "async")]
+        if increased {
+            self.tx_waker.wake();
+        }
+    }
+
     /// Return the remote endpoint, or None if not connected.
     #[inline]
     pub fn remote_endpoint(&self) -> Option<IpEndpoint> {
@@ -979,9 +1040,6 @@ impl<'a> Socket<'a> {
     }
 
     fn reset(&mut self) {
-        let rx_cap_log2 =
-            mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;
-
         self.state = State::Closed;
         self.timer = Timer::new();
         self.rtte.reset();
@@ -995,10 +1053,10 @@ impl<'a> Socket<'a> {
         self.remote_seq_no = TcpSeqNumber::default();
         self.remote_last_seq = TcpSeqNumber::default();
         self.remote_last_ack = None;
-        self.remote_last_win = 0;
+        self.remote_last_win_len = 0;
         self.remote_win_len = 0;
         self.remote_win_scale = None;
-        self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
+        self.remote_win_shift = Self::receive_window_shift(self.rx_capacity_limit);
         self.remote_mss = DEFAULT_MSS;
         self.remote_last_ts = None;
         self.ack_delay_timer = AckDelayTimer::Idle;
@@ -1567,7 +1625,7 @@ impl<'a> Socket<'a> {
         // The window field [...] of every outgoing segment, with the exception of SYN
         // segments, is right-shifted by [advertised scale value] bits[...]
         reply_repr.window_len = self.scaled_window();
-        self.remote_last_win = reply_repr.window_len;
+        self.remote_last_win_len = (reply_repr.window_len as usize) << self.remote_win_shift;
 
         // If the remote supports selective acknowledgement, add the option to the outgoing
         // segment.
@@ -1782,7 +1840,7 @@ impl<'a> Socket<'a> {
 
         let window_start = self.remote_seq_no + self.rx_buffer.len();
         let window_end = if let Some(last_ack) = self.remote_last_ack {
-            last_ack + ((self.remote_last_win as usize) << self.remote_win_shift)
+            last_ack + self.remote_last_win_len
         } else {
             window_start
         };
@@ -1963,7 +2021,9 @@ impl<'a> Socket<'a> {
             // reason is TCP simultaneous open).
             (State::SynReceived, TcpControl::Rst) if self.listen_endpoint.port != 0 => {
                 tcp_trace!("received RST");
-                self.tuple = None;
+                let endpoint = self.listen_endpoint;
+                self.reset();
+                self.listen_endpoint = endpoint;
                 self.set_state(State::Listen);
                 return None;
             }
@@ -2493,11 +2553,7 @@ impl<'a> Socket<'a> {
     /// <https://elixir.bootlin.com/linux/v6.9.9/source/net/ipv4/tcp.c#L1472>.
     fn window_to_update(&self) -> bool {
         match self.state {
-            State::SynSent
-            | State::SynReceived
-            | State::Established
-            | State::FinWait1
-            | State::FinWait2 => {
+            State::Established | State::FinWait1 | State::FinWait2 => {
                 let new_win = self.scaled_window();
                 if let Some(last_win) = self.last_scaled_window() {
                     new_win > 0 && new_win / 2 >= last_win
@@ -2912,7 +2968,11 @@ impl<'a> Socket<'a> {
             .remote_last_seq
             .max(repr.seq_number + repr.segment_len());
         self.remote_last_ack = repr.ack_number;
-        self.remote_last_win = repr.window_len;
+        self.remote_last_win_len = if repr.control == TcpControl::Syn {
+            repr.window_len as usize
+        } else {
+            (repr.window_len as usize) << self.remote_win_shift
+        };
 
         if repr.segment_len() > 0 {
             self.rtte
@@ -3257,7 +3317,10 @@ mod test {
             assert_eq!(s1.remote_seq_no, s2.remote_seq_no, "remote_seq_no");
             assert_eq!(s1.remote_last_seq, s2.remote_last_seq, "remote_last_seq");
             assert_eq!(s1.remote_last_ack, s2.remote_last_ack, "remote_last_ack");
-            assert_eq!(s1.remote_last_win, s2.remote_last_win, "remote_last_win");
+            assert_eq!(
+                s1.remote_last_win_len, s2.remote_last_win_len,
+                "remote_last_win_len"
+            );
             assert_eq!(s1.remote_win_len, s2.remote_win_len, "remote_win_len");
             assert_eq!(s1.timer, s2.timer, "timer");
         }};
@@ -3314,7 +3377,7 @@ mod test {
         s.local_seq_no = LOCAL_SEQ + 1;
         s.remote_last_seq = LOCAL_SEQ + 1;
         s.remote_last_ack = Some(REMOTE_SEQ + 1);
-        s.remote_last_win = s.scaled_window();
+        s.remote_last_win_len = (s.scaled_window() as usize) << s.remote_win_shift;
         s
     }
 
@@ -3400,6 +3463,299 @@ mod test {
     // =========================================================================================//
     // Tests for the CLOSED state.
     // =========================================================================================//
+    #[test]
+    fn test_buffer_growth_preserves_wrapped_receive_and_reassembly() {
+        let mut s = socket_established();
+        s.rx_capacity_limit = 256;
+        // Move the ring head near the end, then keep both committed bytes
+        // and out-of-order bytes spanning the physical wrap boundary.
+        s.rx_buffer.enqueue_slice(&[b'x'; 60]);
+        s.rx_buffer.dequeue_allocated(60);
+        s.rx_buffer.enqueue_slice(b"ab");
+        assert_eq!(s.rx_buffer.write_unallocated(3, b"fgh"), 3);
+        s.assembler.add(3, 3).unwrap();
+        let sequence = s.remote_seq_no;
+        s.grow_receive_buffer(SocketBuffer::new(vec![0; 256]));
+        assert_eq!(s.remote_seq_no, sequence);
+        assert_eq!(s.recv_queue(), 2);
+        assert_eq!(s.rx_buffer.write_unallocated(0, b"cde"), 3);
+        assert_eq!(s.assembler.add_then_remove_front(0, 3).unwrap(), 6);
+        s.rx_buffer.enqueue_unallocated(6);
+        let mut data = [0; 8];
+        assert_eq!(s.recv_slice(&mut data).unwrap(), 8);
+        assert_eq!(&data, b"abcdefgh");
+        assert!(s.window_to_update());
+    }
+
+    #[test]
+    fn test_buffer_growth_preserves_unacknowledged_send() {
+        let mut s = socket_established();
+        s.tx_buffer.enqueue_slice(&[b'x'; 60]);
+        s.tx_buffer.dequeue_allocated(60);
+        s.send_slice(b"abcdefgh").unwrap();
+        let sequence = s.local_seq_no;
+        let sent = s.remote_last_seq;
+        s.grow_send_buffer(SocketBuffer::new(vec![0; 256]));
+        assert_eq!(s.local_seq_no, sequence);
+        assert_eq!(s.remote_last_seq, sent);
+        assert_eq!(s.send_queue(), 8);
+        let mut data = [0; 8];
+        assert_eq!(s.tx_buffer.read_allocated(0, &mut data), 8);
+        assert_eq!(&data, b"abcdefgh");
+    }
+
+    #[test]
+    fn test_buffer_growth_negotiates_limit_with_small_initial_window() {
+        let mut s = socket();
+        s.set_receive_capacity_limit(4 * 1024 * 1024);
+        s.listen(LOCAL_PORT).unwrap();
+        assert_eq!(s.remote_win_shift, 7);
+        let reply = send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                window_scale: Some(0),
+                ..SEND_TEMPL
+            },
+        );
+        assert!(reply.is_none());
+        recv(&mut s, Instant::from_millis(0), |reply| {
+            let reply = reply.unwrap();
+            assert_eq!(reply.window_scale, Some(7));
+            // SYN windows are never scaled and cannot advertise unallocated storage.
+            assert_eq!(reply.window_len, 64);
+        });
+        s.grow_receive_buffer(SocketBuffer::new(vec![0; 128 * 1024]));
+        assert_eq!(s.remote_win_shift, 7);
+        assert_eq!(s.scaled_window(), 1024);
+    }
+
+    #[test]
+    fn test_buffer_growth_without_peer_scaling_stays_unscaled() {
+        let mut s = socket();
+        s.set_receive_capacity_limit(4 * 1024 * 1024);
+        s.listen(LOCAL_PORT).unwrap();
+        send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                window_scale: None,
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!(s.remote_win_shift, 0);
+        s.grow_receive_buffer(SocketBuffer::new(vec![0; 128 * 1024]));
+        assert_eq!(s.scaled_window(), u16::MAX);
+        assert_eq!(s.remote_win_shift, 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_buffer_growth_rejects_receive_shrink() {
+        let mut s = socket_established();
+        s.grow_receive_buffer(SocketBuffer::new(vec![0; 32]));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_buffer_growth_rejects_exceeding_receive_limit() {
+        let mut s = socket_established();
+        s.grow_receive_buffer(SocketBuffer::new(vec![0; 128]));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_buffer_growth_rejects_late_window_scale_change() {
+        let mut s = socket_established();
+        s.set_receive_capacity_limit(128);
+    }
+
+    fn growth_handshake(initial: usize) -> TestSocket {
+        let mut s = socket_with_buffer_sizes(64, initial);
+        s.set_receive_capacity_limit(4 * 1024 * 1024);
+        assert_eq!(s.remote_win_shift, 7);
+        assert_eq!(s.receive_capacity_limit(), 4 * 1024 * 1024);
+        s.listen(LOCAL_PORT).unwrap();
+        send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                window_scale: Some(0),
+                ..SEND_TEMPL
+            },
+        );
+        recv(&mut s, Instant::from_millis(0), |reply| {
+            let reply = reply.unwrap();
+            assert_eq!(reply.window_len, initial as u16);
+            assert_eq!(reply.window_scale, Some(7));
+        });
+        assert!(!s.window_to_update());
+        assert_eq!(s.remote_last_win_len, initial);
+        let ack = s.local_seq_no + 1;
+        send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(ack),
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!(s.state(), State::Established);
+        s
+    }
+
+    #[test]
+    fn test_buffer_growth_syn_window_rejects_outside_and_clips_oversized_data() {
+        for offset in [0, 4096, 8192] {
+            let mut s = growth_handshake(4096);
+            let ack = s.local_seq_no;
+            let payload = [b'x'; 8192];
+            send(
+                &mut s,
+                Instant::from_millis(0),
+                &TcpRepr {
+                    seq_number: REMOTE_SEQ + 1 + offset,
+                    ack_number: Some(ack),
+                    payload: &payload,
+                    ..SEND_TEMPL
+                },
+            );
+            assert_eq!(s.recv_queue(), if offset == 0 { 4096 } else { 0 });
+            assert!(s.assembler.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_buffer_growth_after_handshake_publishes_scaled_window() {
+        for (initial, capacity) in [(4096, 8192), (4096, 128 * 1024), (64, 8192)] {
+            let mut s = growth_handshake(initial);
+            s.grow_receive_buffer(SocketBuffer::new(vec![0; capacity]));
+            assert!(s.window_to_update());
+            let TestSocket { socket, cx } = &mut s;
+            assert_eq!(socket.poll_at(cx), PollAt::Now);
+            recv(&mut s, Instant::from_millis(0), |reply| {
+                assert_eq!(reply.unwrap().window_len as usize, capacity >> 7);
+            });
+            assert_eq!(s.remote_last_win_len, capacity);
+            assert!(!s.window_to_update());
+        }
+    }
+
+    #[test]
+    fn test_buffer_growth_small_increase_waits_for_other_output() {
+        let mut s = growth_handshake(4096);
+        s.grow_receive_buffer(SocketBuffer::new(vec![0; 6144]));
+        assert!(!s.window_to_update());
+        recv_nothing(&mut s, Instant::from_millis(0));
+        s.send_slice(b"x").unwrap();
+        recv(&mut s, Instant::from_millis(0), |reply| {
+            assert_eq!(reply.unwrap().window_len as usize, 6144 >> 7);
+        });
+        assert_eq!(s.remote_last_win_len, 6144);
+    }
+
+    #[test]
+    fn test_buffer_growth_rst_restores_listener_scaling_and_reassembly() {
+        let mut s = socket();
+        s.set_receive_capacity_limit(4 * 1024 * 1024);
+        s.listen(LOCAL_PORT).unwrap();
+        send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                window_scale: None,
+                ..SEND_TEMPL
+            },
+        );
+        recv(&mut s, Instant::from_millis(0), |_| {});
+        assert_eq!(s.remote_win_shift, 0);
+        s.grow_receive_buffer(SocketBuffer::new(vec![0; 128 * 1024]));
+        s.rx_buffer.write_unallocated(3, b"abc");
+        s.assembler.add(3, 3).unwrap();
+        s.tx_buffer.enqueue_slice(b"stale");
+        send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: None,
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!(s.state(), State::Listen);
+        assert_eq!(s.listen_endpoint.port, LOCAL_PORT);
+        assert_eq!(s.remote_win_shift, 7);
+        assert!(s.assembler.is_empty());
+        assert_eq!((s.recv_queue(), s.send_queue()), (0, 0));
+        assert_eq!(s.remote_last_ack, None);
+        assert_eq!(s.remote_last_win_len, 0);
+        s.listen(LOCAL_PORT).unwrap();
+        send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                window_scale: Some(0),
+                ..SEND_TEMPL
+            },
+        );
+        recv(&mut s, Instant::from_millis(0), |reply| {
+            assert_eq!(reply.unwrap().window_scale, Some(7));
+        });
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_buffer_growth_limit_rejects_pending_abort() {
+        let mut s = socket_established();
+        s.abort();
+        s.set_receive_capacity_limit(128);
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn test_buffer_growth_wakes_blocked_sender_only_on_capacity_increase() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::task::{Wake, Waker};
+        struct Counter(AtomicUsize);
+        impl Wake for Counter {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = Waker::from(counter.clone());
+        let mut s = socket_established();
+        s.send_slice(&[b'x'; 64]).unwrap();
+        assert!(!s.can_send());
+        s.register_send_waker(&waker);
+        s.grow_send_buffer(SocketBuffer::new(vec![0; 128]));
+        assert!(s.can_send());
+        assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+        s.register_send_waker(&waker);
+        s.grow_send_buffer(SocketBuffer::new(vec![0; 128]));
+        assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn test_closed_reject() {
         let mut s = socket();
@@ -3803,7 +4159,7 @@ mod test {
 
         let mut s2 = socket_close_wait();
         s2.remote_last_ack = Some(REMOTE_SEQ + 1 + 6 + 1);
-        s2.remote_last_win = 58;
+        s2.remote_last_win_len = 58;
         sanity!(s, s2);
     }
 
@@ -4711,7 +5067,7 @@ mod test {
             })
             .unwrap();
         }
-        assert_eq!(s.remote_last_win, 3500);
+        assert_eq!(s.remote_last_win_len, 3500);
         (s, segment)
     }
 
@@ -4807,7 +5163,7 @@ mod test {
         s.rx_buffer = SocketBuffer::new(vec![0; 262143]);
         s.assembler = Assembler::new();
         s.remote_win_scale = Some(0);
-        s.remote_last_win = 65535;
+        s.remote_last_win_len = 65535 << 2;
         s.remote_win_shift = 2;
 
         // Create a TCP segment that will mostly fill an IP frame.
@@ -8309,8 +8665,8 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
-        // Test that `dispatch` updates `remote_last_win`
-        assert_eq!(s.remote_last_win, s.rx_buffer.window() as u16);
+        // Test that `dispatch` updates `remote_last_win_len`
+        assert_eq!(s.remote_last_win_len, s.rx_buffer.window());
         s.recv(|buffer| (buffer.len(), ())).unwrap();
         assert!(s.window_to_update());
         recv!(
@@ -8322,8 +8678,8 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
-        assert_eq!(s.remote_last_win, s.rx_buffer.window() as u16);
-        // Provoke immediate ACK to test that `process` updates `remote_last_win`
+        assert_eq!(s.remote_last_win_len, s.rx_buffer.window());
+        // Provoke immediate ACK to test that `process` updates `remote_last_win_len`
         send!(
             s,
             TcpRepr {
@@ -8354,7 +8710,7 @@ mod test {
                 ..RECV_TEMPL
             })
         );
-        assert_eq!(s.remote_last_win, s.rx_buffer.window() as u16);
+        assert_eq!(s.remote_last_win_len, s.rx_buffer.window());
         s.recv(|buffer| (buffer.len(), ())).unwrap();
         assert!(s.window_to_update());
     }

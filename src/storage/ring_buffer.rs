@@ -30,6 +30,22 @@ pub struct RingBuffer<'a, T: 'a> {
     length: usize,
 }
 
+impl<'a, T: Copy> RingBuffer<'a, T> {
+    /// Replace backing storage without changing logical offsets. TCP may have
+    /// out-of-order data in the unallocated region, so copy the entire old
+    /// storage rather than just the committed FIFO prefix.
+    pub(crate) fn grow(&mut self, mut replacement: Self) {
+        assert!(replacement.capacity() >= self.capacity());
+        let capacity = self.capacity();
+        let tail = capacity - self.read_at;
+        replacement.storage[..tail].copy_from_slice(&self.storage[self.read_at..]);
+        replacement.storage[tail..capacity].copy_from_slice(&self.storage[..self.read_at]);
+        replacement.read_at = 0;
+        replacement.length = self.length;
+        *self = replacement;
+    }
+}
+
 impl<'a, T: 'a> RingBuffer<'a, T> {
     /// Create a ring buffer with the given storage.
     ///
